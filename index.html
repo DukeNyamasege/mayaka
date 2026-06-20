@@ -40,8 +40,61 @@
         .subtitle {
             text-align: center;
             color: #666;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             font-size: 14px;
+        }
+
+        .engine-badge {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin: 0 auto 25px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            width: fit-content;
+            background: #fff7ed;
+            color: #b45309;
+            border: 1px solid #fed7aa;
+            transition: background 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+        }
+
+        .engine-badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 0 0 0 currentColor;
+        }
+
+        .engine-badge.is-loading .dot {
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+
+        .engine-badge.is-ready {
+            background: #ecfdf5;
+            color: #047857;
+            border-color: #a7f3d0;
+        }
+
+        .engine-badge.is-fallback {
+            background: #fff1f2;
+            color: #be123c;
+            border-color: #fecdd3;
+        }
+
+        .engine-badge.is-error {
+            background: #fef2f2;
+            color: #b91c1c;
+            border-color: #fecaca;
+        }
+
+        @keyframes pulse {
+            0%   { box-shadow: 0 0 0 0 rgba(180, 83, 9, 0.5); }
+            70%  { box-shadow: 0 0 0 8px rgba(180, 83, 9, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(180, 83, 9, 0); }
         }
         
         .upload-area {
@@ -226,7 +279,13 @@
     <div class="container">
         <h1>🎵 Mayaka Audio Extractor</h1>
         <p class="subtitle">Extract audio from any video file</p>
-        
+
+        <!-- Engine status -->
+        <div class="engine-badge is-loading" id="engineBadge" role="status" aria-live="polite">
+            <span class="dot"></span>
+            <span class="label" id="engineBadgeLabel">Initializing engine…</span>
+        </div>
+
         <!-- Upload Area -->
         <div class="upload-area" id="uploadArea">
             <div class="upload-icon">📁</div>
@@ -278,19 +337,37 @@
         const extractBtn = document.getElementById('extractBtn');
         const clearBtn = document.getElementById('clearBtn');
         const statusMessage = document.getElementById('statusMessage');
+        const engineBadge = document.getElementById('engineBadge');
+        const engineBadgeLabel = document.getElementById('engineBadgeLabel');
 
         let selectedFile = null;
         let ffmpeg = null;
         let isProcessing = false;
-        let ffmpegLoading = null;
+        let ffmpegLoading = null;       // Singleton in-flight load promise
+        let loadMode = 'preload';       // 'preload' = keep instance warm; 'on-demand' = load per run
 
-        // Environment checks
+        // ----- Engine status badge -----
+        const ENGINE_STATES = {
+            initializing: { cls: 'is-loading',  label: 'Initializing engine…' },
+            loading:      { cls: 'is-loading',  label: 'Loading audio engine…' },
+            ready:        { cls: 'is-ready',    label: '✓ Engine ready' },
+            fallback:     { cls: 'is-fallback', label: '⚠ Load-on-demand mode (close other tabs)' },
+            error:        { cls: 'is-error',    label: '✕ Engine unavailable' }
+        };
+        function setEngineState(state, customLabel) {
+            const cfg = ENGINE_STATES[state];
+            if (!cfg) return;
+            engineBadge.className = 'engine-badge ' + cfg.cls;
+            engineBadgeLabel.textContent = customLabel || cfg.label;
+        }
+
+        // ----- Environment checks -----
         function checkEnvironment() {
             if (location.protocol === 'file:') {
                 return 'This page must be served from a web server (http:// or https://), not opened directly from disk (file://). FFmpeg.wasm cannot load from file:// URLs.';
             }
             if (typeof SharedArrayBuffer === 'undefined') {
-                return 'SharedArrayBuffer is not available. The page must be served with cross-origin isolation headers (COOP: same-origin and COEP: require-corp), or over a secure context that supports it.';
+                return 'SharedArrayBuffer is not available. The page must be served with cross-origin isolation headers (COOP: same-origin and COEP: require-corp).';
             }
             if (typeof FFmpeg === 'undefined') {
                 return 'FFmpeg library failed to load from the CDN. Check your internet connection or ad-blocker.';
@@ -298,20 +375,46 @@
             return null;
         }
 
-        // Initialize FFmpeg
-        async function initFFmpeg() {
+        // ----- Tear down any existing FFmpeg instance and free its WebAssembly memory -----
+        function disposeFFmpeg() {
+            if (ffmpeg) {
+                try {
+                    if (ffmpeg.isLoaded && ffmpeg.isLoaded() && typeof ffmpeg.exit === 'function') {
+                        ffmpeg.exit();
+                    }
+                } catch (e) { /* ignore */ }
+            }
+            ffmpeg = null;
+        }
+
+        function isMemoryError(error) {
+            const msg = (error && (error.message || error.toString())) || '';
+            return /allocate memory|out of memory|WebAssembly\.Memory|RangeError/i.test(msg);
+        }
+
+        function idle(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // ----- Singleton FFmpeg loader -----
+        // Returns true on success, false on failure. Safe to call concurrently:
+        // all callers await the same in-flight promise.
+        async function ensureFFmpeg() {
             if (ffmpeg && ffmpeg.isLoaded && ffmpeg.isLoaded()) return true;
             if (ffmpegLoading) return ffmpegLoading;
 
             ffmpegLoading = (async () => {
-                try {
-                    const envError = checkEnvironment();
-                    if (envError) throw new Error(envError);
+                const envError = checkEnvironment();
+                if (envError) {
+                    setEngineState('error', '✕ ' + envError);
+                    statusMessage.textContent = '❌ ' + envError;
+                    statusMessage.className = 'status-message error';
+                    return false;
+                }
 
-                    statusMessage.textContent = 'Loading FFmpeg (this can take a moment)...';
-                    statusMessage.className = 'status-message';
-
-                    const { createFFmpeg } = FFmpeg;
+                const { createFFmpeg } = FFmpeg;
+                const attempt = async () => {
+                    disposeFFmpeg();
                     ffmpeg = createFFmpeg({
                         log: true,
                         // Explicit corePath avoids the default loader's CDN guess that often 404s
@@ -323,16 +426,37 @@
                             progressText.textContent = `Processing: ${percent}%`;
                         }
                     });
-
                     await ffmpeg.load();
-                    statusMessage.textContent = '✅ FFmpeg loaded successfully!';
-                    statusMessage.className = 'status-message success';
+                };
+
+                try {
+                    setEngineState('loading');
+                    try {
+                        await attempt();
+                    } catch (firstError) {
+                        if (!isMemoryError(firstError)) throw firstError;
+                        console.warn('FFmpeg memory allocation failed, retrying once...', firstError);
+                        setEngineState('loading', 'Memory pressure — retrying…');
+                        disposeFFmpeg();
+                        await idle(1500);
+                        await attempt();
+                    }
+                    setEngineState('ready');
                     return true;
                 } catch (error) {
                     console.error('FFmpeg load error:', error);
-                    ffmpeg = null;
-                    statusMessage.textContent = '❌ Failed to load FFmpeg: ' + (error && error.message ? error.message : error);
-                    statusMessage.className = 'status-message error';
+                    disposeFFmpeg();
+                    if (isMemoryError(error)) {
+                        // Graceful fallback: switch to load-on-demand for future attempts
+                        loadMode = 'on-demand';
+                        setEngineState('fallback');
+                        statusMessage.textContent = '⚠ Not enough memory to preload. Close inactive browser tabs and the engine will load when you click Extract.';
+                        statusMessage.className = 'status-message error';
+                    } else {
+                        setEngineState('error');
+                        statusMessage.textContent = '❌ Failed to load FFmpeg: ' + (error && error.message ? error.message : error);
+                        statusMessage.className = 'status-message error';
+                    }
                     return false;
                 } finally {
                     ffmpegLoading = null;
@@ -340,6 +464,15 @@
             })();
 
             return ffmpegLoading;
+        }
+
+        // ----- Service Worker registration (caches the ~25 MB FFmpeg core) -----
+        function registerServiceWorker() {
+            if (!('serviceWorker' in navigator)) return Promise.resolve(null);
+            return navigator.serviceWorker.register('sw.js').catch((err) => {
+                console.warn('Service worker registration failed:', err);
+                return null;
+            });
         }
         
         // Handle file selection
@@ -420,9 +553,9 @@
             
             if (isProcessing) return;
             
-            // Initialize FFmpeg if not already
+            // Initialize FFmpeg if not already (uses singleton)
             if (!ffmpeg || !ffmpeg.isLoaded || !ffmpeg.isLoaded()) {
-                const loaded = await initFFmpeg();
+                const loaded = await ensureFFmpeg();
                 if (!loaded) return;
             }
 
@@ -477,38 +610,59 @@
                 progressText.textContent = '✅ Extraction complete!';
                 statusMessage.textContent = '✅ Download started!';
                 statusMessage.className = 'status-message success';
-                
+
             } catch (error) {
                 console.error('Extraction error:', error);
-                statusMessage.textContent = '❌ Error extracting audio: ' + error.message;
+                if (isMemoryError(error)) {
+                    statusMessage.textContent = '❌ Ran out of memory while extracting. Try a shorter/smaller video, or close other browser tabs and try again.';
+                } else {
+                    statusMessage.textContent = '❌ Error extracting audio: ' + (error && error.message ? error.message : error);
+                }
                 statusMessage.className = 'status-message error';
                 progressText.textContent = '❌ Extraction failed';
             } finally {
+                // In on-demand mode, dispose between runs to recover memory.
+                // In preload mode, keep the warm instance for instant subsequent extractions.
+                if (loadMode === 'on-demand') {
+                    disposeFFmpeg();
+                } else {
+                    setEngineState('ready');
+                }
                 isProcessing = false;
                 extractBtn.disabled = false;
             }
         });
-        
+
         // Helper function to get file extension
         function getFileExtension(filename) {
             const ext = filename.split('.').pop();
             return ext ? '.' + ext : '';
         }
-        
-        // Auto-init FFmpeg on page load
-        window.addEventListener('load', () => {
+
+        // ----- Page load: register service worker, then preload FFmpeg in background -----
+        window.addEventListener('load', async () => {
             const envError = checkEnvironment();
             if (envError) {
+                setEngineState('error', '✕ ' + envError);
                 statusMessage.textContent = '❌ ' + envError;
                 statusMessage.className = 'status-message error';
                 return;
             }
-            // Preload FFmpeg in background
-            setTimeout(() => {
-                if (!ffmpeg) {
-                    initFFmpeg();
-                }
-            }, 500);
+
+            setEngineState('initializing');
+
+            // Register the service worker first so the FFmpeg fetches can hit the cache.
+            // We don't block on its activation — preload starts right after registration.
+            await registerServiceWorker();
+
+            // Kick off background preload. ensureFFmpeg() is a singleton so a later
+            // Extract click will just await the same promise — no double-loading.
+            ensureFFmpeg();
+        });
+
+        // Free FFmpeg memory if the user navigates away
+        window.addEventListener('beforeunload', () => {
+            disposeFFmpeg();
         });
     </script>
 </body>
